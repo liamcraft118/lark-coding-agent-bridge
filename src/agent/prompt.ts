@@ -114,6 +114,20 @@ export function promptSection(tag: string, value: unknown): string {
   return `<${tag}>\n${safeJsonStringify(value)}\n</${tag}>`;
 }
 
+export function extractPromptUserText(prompt: string): string {
+  const section = prompt.match(/<user_input>\s*([\s\S]*?)\s*<\/user_input>/);
+  if (!section) return prompt;
+  try {
+    const value: unknown = JSON.parse(section[1] ?? '');
+    if (value && typeof value === 'object' && 'text' in value && typeof value.text === 'string') {
+      return value.text;
+    }
+  } catch {
+    // Malformed bridge metadata must not become a search query.
+  }
+  return '';
+}
+
 export function safeJsonStringify(value: unknown): string {
   return (JSON.stringify(value) ?? 'null')
     .replace(/</g, '\\u003c')

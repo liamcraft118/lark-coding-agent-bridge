@@ -1,4 +1,6 @@
 import type { AgentCapability } from '../agent/capability';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { resolveModelArg } from '../agent/models';
 import type { AgentEvent } from '../agent/types';
 import type { ProfileConfig } from '../config/profile-schema';
@@ -20,6 +22,8 @@ import { RunRejected, type RunRejectedCode } from '../runtime/errors';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
+import { enrichPromptWithWebPages } from '../web/read-only-fetch';
+import { searchWeb } from '../web/search';
 
 export interface StartRunFlowInput {
   scopeId: string;
@@ -75,8 +79,14 @@ export interface RecordRunSessionEventInput {
 }
 
 export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFlowResult> {
-  const requestedCwd =
-    input.workspaces.cwdFor(input.scopeId) ?? input.profileConfig.workspaces.default ?? '';
+  let prompt = input.access.ok ? await enrichPromptWithWebPages(input.prompt) : input.prompt;
+  if (input.access.ok) {
+    const searchContext = await searchWeb(input.prompt);
+    if (searchContext) {
+      prompt = `${prompt}\n\n以下是 Bridge 通过只读公开搜索取得的候选结果。请核对来源、时间和内容，不要把摘要当作已确认事实：\n${searchContext}`;
+    }
+  }
+  const requestedCwd = await resolveRunWorkspace(input);
   const workspace = await resolveWorkingDirectory(requestedCwd);
   if (!workspace.ok) {
     return {
@@ -92,7 +102,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   const policy = evaluateRunPolicy({
     scope: input.scope,
     attachments: input.attachments,
-    prompt: input.prompt,
+    prompt,
     requestedCwd,
     cwdRealpath: workspace.cwdRealpath,
     access: input.access,
@@ -124,8 +134,23 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       sessionId = catalogEntry.sessionId;
       resumeFrom = sessionId;
     } else if (catalogEntry?.agentId === 'codex') {
-      threadId = catalogEntry.threadId;
-      resumeFrom = threadId;
+      const catalogThreadId = catalogEntry.threadId;
+      const containerHistory = input.profileConfig.codex?.container?.enabled
+        ? join(workspace.cwdRealpath, '.codex-home', 'history.jsonl')
+        : undefined;
+      let canResumeContainerThread = !containerHistory;
+      if (containerHistory && existsSync(containerHistory)) {
+        try {
+          canResumeContainerThread = Boolean(catalogThreadId)
+            && readFileSync(containerHistory, 'utf8').includes(catalogThreadId as string);
+        } catch {
+          canResumeContainerThread = false;
+        }
+      }
+      if (canResumeContainerThread) {
+        threadId = catalogThreadId;
+        resumeFrom = threadId;
+      }
     }
   }
   if (!resumeFrom && input.capability.agentId === 'claude') {
@@ -186,6 +211,18 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   };
 }
 
+async function resolveRunWorkspace(input: StartRunFlowInput): Promise<string> {
+  const mapped = input.workspaces.cwdFor(input.scopeId);
+  if (mapped) return mapped;
+  const base = input.profileConfig.workspaces.default ?? '';
+  if (!base.includes('/agent-users/')) return base;
+  const key = createHash('sha256').update(input.scopeId).digest('hex').slice(0, 20);
+  const cwd = `${base}/scopes/${key}`;
+  await mkdir(cwd, { recursive: true, mode: 0o700 });
+  input.workspaces.setCwd(input.scopeId, cwd);
+  return cwd;
+}
+
 export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
   if (input.event.type !== 'system') return;
   if (input.capability.agentId === 'claude' && input.event.sessionId) {
@@ -210,3 +247,5 @@ export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
     });
   }
 }
+import { createHash } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';

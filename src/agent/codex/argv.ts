@@ -9,6 +9,8 @@ export interface BuildCodexArgsInput {
   ignoreRules?: boolean;
   /** Forwarded to `codex exec --model`. Omitted uses the Codex default. */
   model?: string;
+  approvalPolicy?: 'never' | 'on-request' | 'unless-trusted' | 'reject';
+  shellEnvironmentInheritance?: 'all' | 'core' | 'none';
 }
 
 export function buildCodexArgs(input: BuildCodexArgsInput): string[] {
@@ -25,9 +27,9 @@ export function buildCodexArgs(input: BuildCodexArgsInput): string[] {
     input.sandbox,
     ...(input.model ? ['--model', input.model] : []),
     '-c',
-    'approval_policy="never"',
+    `approval_policy="${input.approvalPolicy ?? 'never'}"`,
     '-c',
-    'shell_environment_policy.inherit="all"',
+    `shell_environment_policy.inherit="${input.shellEnvironmentInheritance ?? 'all'}"`,
     ...(input.ignoreUserConfig === true ? ['--ignore-user-config'] : []),
     ...(input.ignoreRules === false ? [] : ['--ignore-rules']),
     '--skip-git-repo-check',

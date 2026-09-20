@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { mkdirSync } from 'node:fs';
 import type { Readable, Writable } from 'node:stream';
 import { join } from 'node:path';
 import type { SandboxMode } from '../../config/profile-schema';
@@ -25,9 +26,12 @@ export interface CodexAdapterOptions {
   inheritCodexHome?: boolean;
   ignoreUserConfig?: boolean;
   ignoreRules?: boolean;
+  approvalPolicy?: 'never' | 'on-request' | 'unless-trusted' | 'reject';
+  shellEnvironmentInheritance?: 'all' | 'core' | 'none';
   sandbox?: SandboxMode;
   stopGraceMs?: number;
   larkChannel?: LarkChannelEnvContext;
+  container?: { enabled: boolean; image: string };
 }
 
 type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
@@ -42,9 +46,12 @@ export class CodexAdapter implements AgentAdapter {
   private readonly inheritCodexHome: boolean;
   private readonly ignoreUserConfig: boolean;
   private readonly ignoreRules: boolean;
+  private readonly approvalPolicy: CodexAdapterOptions['approvalPolicy'];
+  private readonly shellEnvironmentInheritance: CodexAdapterOptions['shellEnvironmentInheritance'];
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private readonly container: CodexAdapterOptions['container'];
   private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: CodexAdapterOptions) {
@@ -54,9 +61,12 @@ export class CodexAdapter implements AgentAdapter {
     this.inheritCodexHome = opts.inheritCodexHome !== false;
     this.ignoreUserConfig = opts.ignoreUserConfig === true;
     this.ignoreRules = opts.ignoreRules !== false;
+    this.approvalPolicy = opts.approvalPolicy;
+    this.shellEnvironmentInheritance = opts.shellEnvironmentInheritance;
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
     this.larkChannel = opts.larkChannel;
+    this.container = opts.container?.enabled ? opts.container : undefined;
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
@@ -68,6 +78,14 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async checkAvailability(): Promise<AgentAvailability> {
+    if (this.container) {
+      return checkAgentAvailability({
+        agentId: 'codex',
+        agentName: 'Codex Docker runtime',
+        command: 'docker',
+        binaryPath: 'docker',
+      });
+    }
     return checkAgentAvailability({
       agentId: 'codex',
       agentName: 'Codex CLI',
@@ -93,14 +111,19 @@ export class CodexAdapter implements AgentAdapter {
       throw new Error('cwd is required for CodexAdapter.run');
     }
 
+    const agentCwd = this.container ? '/workspace' : opts.cwd;
     const args = buildCodexArgs({
-      cwd: opts.cwd,
-      sandbox: opts.sandbox ?? this.sandbox,
+      cwd: agentCwd,
+      // Docker is the security boundary. A nested Linux bwrap sandbox cannot
+      // create namespaces under Docker Desktop's default seccomp policy.
+      sandbox: this.container ? 'danger-full-access' : (opts.sandbox ?? this.sandbox),
       threadId: opts.threadId,
       images: opts.images,
       ignoreUserConfig: this.ignoreUserConfig,
       ignoreRules: this.ignoreRules,
       model: opts.model,
+      approvalPolicy: this.container ? 'never' : this.approvalPolicy,
+      shellEnvironmentInheritance: this.shellEnvironmentInheritance,
     });
     const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
     if (this.codexHome) {
@@ -108,15 +131,39 @@ export class CodexAdapter implements AgentAdapter {
     } else if (!this.inheritCodexHome) {
       envOverrides.CODEX_HOME = join(this.profileStateDir, 'codex-home');
     }
-    const child = spawnProcess(this.binary, args, {
-      cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, envOverrides),
+    let command = this.binary;
+    let commandArgs = args;
+    let spawnCwd = opts.cwd;
+    if (this.container) {
+      const workspaceHome = join(opts.cwd, '.codex-home');
+      mkdirSync(workspaceHome, { recursive: true });
+      const seedHome = this.codexHome ?? join(this.profileStateDir, 'codex-home');
+      command = 'docker';
+      commandArgs = [
+        'run', '--rm', '--init', '-i',
+        '--network', 'bridge',
+        '--mount', `type=bind,src=${opts.cwd},dst=/workspace`,
+        '--mount', `type=bind,src=${workspaceHome},dst=/codex-home`,
+        '--mount', `type=bind,src=${seedHome},dst=/seed,readonly`,
+        '--workdir', '/workspace',
+        '--env', 'CODEX_HOME=/codex-home',
+        this.container.image,
+        ...args,
+      ];
+      spawnCwd = opts.cwd;
+    }
+    const child = spawnProcess(command, commandArgs, {
+      cwd: spawnCwd,
+      env: this.container
+        ? { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin' }
+        : mergeProcessEnv(process.env, envOverrides),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as CodexChild;
 
     log.info('agent', 'spawn', {
       pid: child.pid ?? null,
       cwd: opts.cwd,
+      container: Boolean(this.container),
       hasThread: Boolean(opts.threadId),
       promptChars: opts.prompt.length,
       images: opts.images?.length ?? 0,

@@ -67,6 +67,13 @@ import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quo
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
+import {
+  changedWorkspaceFiles,
+  extractFileRequests,
+  generateFiles,
+  snapshotWorkspace,
+  type WorkspaceSnapshot,
+} from '../files/generator';
 import type { AppPaths } from '../config/app-paths';
 import {
   consumeCotEvents,
@@ -252,6 +259,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     includeRawEvent: true,
     outbound: {
       streamThrottleMs: 400,
+      // Generated files are written under the profile's workspace. Keep the
+      // SDK's local-file uploader allowlist scoped to that same root.
+      allowedFileDirs: controls.profileConfig.workspaces.default
+        ? [controls.profileConfig.workspaces.default]
+        : [],
     },
     // SDK 1.65.0-alpha.3+ knobs.
     wsConfig: {
@@ -992,6 +1004,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   }
 
   const { execution, cwdRealpath: cwd } = flow;
+  const workspaceBefore = await snapshotWorkspace(cwd);
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
@@ -1114,6 +1127,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           channel,
           chatId,
           scope,
+          cwd,
+          workspaceBefore,
           state: finalAnswerOnlyState(finalState),
           replyMode,
           sendOpts,
@@ -1188,6 +1203,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           channel,
           chatId,
           scope,
+          cwd,
+          workspaceBefore,
           state: finalReplyState(progress, filterForPrefs(latestState)),
           replyMode,
           sendOpts,
@@ -1251,6 +1268,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           channel,
           chatId,
           scope,
+          cwd,
+          workspaceBefore,
           state: finalReplyState(progress, filterForPrefs(latestState)),
           replyMode,
           sendOpts,
@@ -1273,6 +1292,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         channel,
         chatId,
         scope,
+        cwd,
+        workspaceBefore,
         state:
           controls.profileConfig.agentKind === 'codex'
             ? finalAnswerOnlyState(filterForPrefs(finalState))
@@ -1445,25 +1466,48 @@ async function sendFinalReply(input: {
   channel: LarkChannel;
   chatId: string;
   scope: string;
+  cwd: string;
+  workspaceBefore: WorkspaceSnapshot;
   state: RunState;
   replyMode: ReturnType<typeof getMessageReplyMode>;
   sendOpts: { replyTo: string; replyInThread?: boolean };
   cardRenderOptions: { signCallback?: (action: string) => string };
 }): Promise<void> {
-  const body = renderText(input.state);
+  const rawBody = renderText(input.state);
+  const extracted = extractFileRequests(rawBody);
+  let state = input.state;
+  if (extracted.files.length > 0) {
+    state = stripFileMarkers(state, extracted.text);
+  }
+  let generatedFiles: Awaited<ReturnType<typeof generateFiles>> = [];
+  if (extracted.files.length > 0) {
+    try {
+      generatedFiles = await generateFiles(extracted.files, input.cwd);
+    } catch (err) {
+      log.warn('outbound', 'file-generation-failed', {
+        scope: input.scope,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      state = appendText(state, `\n\n文件生成失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const changedFiles = await changedWorkspaceFiles(input.cwd, input.workspaceBefore);
+  generatedFiles = [...generatedFiles, ...changedFiles.filter((file) => !generatedFiles.some((existing) => existing.path === file.path))];
+  const body = renderText(state);
 
   // Nothing deliverable to send (agent produced no text on a clean finish;
   // error/interrupt/timeout keep `body` non-empty via their notices). Skip
   // rather than post an empty card that renders as "(no content)".
   if (!body.trim()) {
     log.info('outbound', 'skip-empty', { scope: input.scope, mode: input.replyMode });
+    await sendGeneratedFiles(input, generatedFiles);
     return;
   }
 
   if (input.replyMode === 'card') {
     const result = await input.channel.send(
       input.chatId,
-      { card: renderCard(input.state, input.cardRenderOptions) },
+      { card: renderCard(state, input.cardRenderOptions) },
       input.sendOpts,
     );
     requireMessageReceipt(result, 'card');
@@ -1486,6 +1530,44 @@ async function sendFinalReply(input: {
     );
     requireMessageReceipt(result, 'text');
     log.info('outbound', 'sent', outboundLogFields(input, 'text', body, result));
+  }
+  await sendGeneratedFiles(input, generatedFiles);
+}
+
+function stripFileMarkers(state: RunState, text: string): RunState {
+  return {
+    ...state,
+    finalText: state.finalText ? text : state.finalText,
+    blocks: state.blocks.map((block) =>
+      block.kind === 'text' ? { ...block, content: extractFileRequests(block.content).text } : block,
+    ),
+  };
+}
+
+function appendText(state: RunState, suffix: string): RunState {
+  if (state.finalText) return { ...state, finalText: `${state.finalText}${suffix}` };
+  return {
+    ...state,
+    blocks: [...state.blocks, { kind: 'text', content: suffix.trim(), streaming: false }],
+  };
+}
+
+async function sendGeneratedFiles(
+  input: { channel: LarkChannel; chatId: string; scope: string; sendOpts: { replyTo: string; replyInThread?: boolean } },
+  files: readonly { path: string; fileName: string; format: string }[],
+): Promise<void> {
+  for (const file of files) {
+    try {
+      const result = await input.channel.send(
+        input.chatId,
+        { file: { source: file.path, fileName: file.fileName } },
+        input.sendOpts,
+      );
+      requireMessageReceipt(result, 'file');
+      log.info('outbound', 'file-sent', { scope: input.scope, fileName: file.fileName, format: file.format, messageId: result.messageId });
+    } catch (err) {
+      log.warn('outbound', 'file-send-failed', { scope: input.scope, fileName: file.fileName, err: err instanceof Error ? err.message : String(err) });
+    }
   }
 }
 

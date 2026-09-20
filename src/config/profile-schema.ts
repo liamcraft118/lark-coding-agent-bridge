@@ -49,6 +49,19 @@ export interface CodexConfig {
   inheritCodexHome?: boolean;
   ignoreUserConfig?: boolean;
   ignoreRules?: boolean;
+  /** Codex approval policy passed to the child process. */
+  approvalPolicy?: 'never' | 'on-request' | 'unless-trusted' | 'reject';
+  /** Which parent environment variables Codex shell commands may inherit. */
+  shellEnvironmentInheritance?: 'all' | 'core' | 'none';
+  /** Run this profile through the tool-free Chat API adapter. */
+  chatOnly?: boolean;
+  chatBaseUrl?: string;
+  chatApiKeyFile?: string;
+  /** Run Codex inside a per-run Docker container. */
+  container?: {
+    enabled: boolean;
+    image: string;
+  };
 }
 
 export interface AttachmentConfig {
@@ -387,6 +400,16 @@ function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {
     inheritCodexHome: input.inheritCodexHome !== false,
     ignoreUserConfig: input.ignoreUserConfig === true,
     ignoreRules: input.ignoreRules !== false,
+    ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
+    ...(input.shellEnvironmentInheritance
+      ? { shellEnvironmentInheritance: input.shellEnvironmentInheritance }
+      : {}),
+    ...(input.chatOnly === true ? { chatOnly: true } : {}),
+    ...(typeof input.chatBaseUrl === 'string' ? { chatBaseUrl: input.chatBaseUrl } : {}),
+    ...(typeof input.chatApiKeyFile === 'string' ? { chatApiKeyFile: input.chatApiKeyFile } : {}),
+    ...(input.container?.enabled === true && typeof input.container.image === 'string' && input.container.image.trim()
+      ? { container: { enabled: true, image: input.container.image.trim() } }
+      : {}),
   };
   return codex;
 }

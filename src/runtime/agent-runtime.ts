@@ -1,5 +1,6 @@
 import { ClaudeAdapter } from '../agent/claude/adapter';
 import { CodexAdapter } from '../agent/codex/adapter';
+import { ChatAdapter } from '../agent/chat/adapter';
 import { AgentPreflightError, type AgentAvailability } from '../agent/preflight';
 import type { AgentAdapter } from '../agent/types';
 import type { AppPaths } from '../config/app-paths';
@@ -38,6 +39,13 @@ export function createRuntimeAgent(
     if (!codex?.binaryPath) {
       throw new Error('codex profile requires codex.binaryPath');
     }
+    if (codex.chatOnly) {
+      return new ChatAdapter({
+        baseUrl: codex.chatBaseUrl ?? 'https://api.openai.com',
+        model: profileConfig.preferences.model ?? 'gpt-5.6-sol',
+        apiKeyFile: codex.chatApiKeyFile ?? `${appPaths.profileDir}/codex-home/auth.json`,
+      });
+    }
     return new CodexAdapter({
       binary: codex.binaryPath,
       profileStateDir: appPaths.profileDir,
@@ -45,8 +53,13 @@ export function createRuntimeAgent(
       inheritCodexHome: codex.inheritCodexHome === true,
       ignoreUserConfig: codex.ignoreUserConfig === true,
       ignoreRules: codex.ignoreRules !== false,
+      ...(codex.approvalPolicy ? { approvalPolicy: codex.approvalPolicy } : {}),
+      ...(codex.shellEnvironmentInheritance
+        ? { shellEnvironmentInheritance: codex.shellEnvironmentInheritance }
+        : {}),
       sandbox: profileConfig.sandbox.defaultMode,
       larkChannel,
+      ...(codex.container ? { container: codex.container } : {}),
     });
   }
   return new ClaudeAdapter({ larkChannel });

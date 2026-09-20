@@ -136,4 +136,15 @@ describe('Codex argv contract', () => {
     ).toContain('--ignore-user-config');
   });
 
+  it('allows a restricted profile to require approval and avoid shell env inheritance', () => {
+    const args = buildCodexArgs({
+      cwd: '/repo',
+      sandbox: 'workspace-write',
+      approvalPolicy: 'on-request',
+      shellEnvironmentInheritance: 'none',
+    });
+    expect(args).toContain('approval_policy="on-request"');
+    expect(args).toContain('shell_environment_policy.inherit="none"');
+  });
+
 });
